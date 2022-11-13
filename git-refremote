@@ -9,7 +9,8 @@ todo() {
     abort "TODO${*:+: }$*"
 }
 
-set -ex
+set -e
+[[ -z "$GIT_REFREMOTE_TRACE" ]] || set -x
 
 readonly scriptname="${0##*/}"
 readonly basedir="${GIT_REFREMOTE_BASE:-${XDG_CACHE_HOME:-$HOME/.cache}/git-refremote}"
@@ -24,20 +25,26 @@ set_refdir_for() {
 }
 
 detect_gitdir() {
+    [[ -n "$gitdir" ]] && return
     gitdir=$(git rev-parse --git-dir)
 }
 
-detect_remote_uri() {
-    if [[ -z "$remote_uri" ]]; then
-        remote_uri=$(git remote get-url "$(git remote show)") || return 1
-    fi
+get_remote_uri_for() {
+    remote_uri=$(git remote get-url "$1") || return 1
+}
+
+detect_sole_remote_uri() {
+    local remotes=($(git remote show))
+    [[ ${#remotes[@]} == 1 ]] || return 1
+    remote=${remotes[0]}
+    remote_uri=$(git remote get-url "$remote") || return 1
 }
 
 detect_refdir() {
     if [[ -z "$refdir" ]]; then
         detect_gitdir
         [[ -r "$gitdir/objects/info/alternates" ]] || return 1
-        detect_remote_uri
+        [[ -n "$remote_uri" ]] || detect_sole_remote_uri
         refdir=$(grep "$(calc_refdir_suffix_for "$remote_uri")/objects\$" "$gitdir/objects/info/alternates")
         [[ -n "$refdir" && -d "$refdir" ]] || return 1
         refdir="${refdir%/objects}"
@@ -69,12 +76,30 @@ do_clone() {
 }
 
 do_update() {
+    if [[ -n "$1" ]]; then
+        remote="$1"
+        shift
+        get_remote_uri_for "$remote"
+    else
+        detect_sole_remote_uri || abort "Can't detect remote. Please specify"
+    fi
+
+    get_remote_uri_for "$remote"
     ensure_refdir_detected
     update_refdir
-    exec git remote update "$@"
+    exec git remote update "$remote" "$@"
 }
 
 do_scrub() {
+    echo "WARN: Consider doing just git gc instead" >&2
+    if [[ -n "$1" ]]; then
+        remote="$1"
+        shift
+        get_remote_uri_for "$remote"
+    else
+        detect_sole_remote_uri || abort "Can't detect remote. Please specify"
+    fi
+
     detect_gitdir
     ensure_refdir_detected
 
@@ -87,30 +112,38 @@ do_scrub() {
     done
 
     for obj in "$refdir/objects/objects"/??/*; do
-        obj="${pack#$refdir/objects/objects/}"
-        if [[ -x "$gitdir/objects/$obj" ]]; then
+        obj="${obj#$refdir/objects/objects/}"
+        if [[ -e "$gitdir/objects/$obj" ]]; then
             rm -vi "$gitdir/objects/$obj"
         fi
     done
 }
 
 do_setup() {
+    if [[ -n "$1" ]]; then
+        remote="$1"
+        shift
+        get_remote_uri_for "$remote"
+    else
+        detect_sole_remote_uri || abort "Can't detect remote. Please specify"
+    fi
+
     detect_gitdir
-    detect_refdir && abort "Already managed by $scriptname"
-    detect_remote_uri
+    detect_refdir && abort "Remote $remote already managed by $scriptname in $gitdir"
+
     set_refdir_for "$remote_uri"
     ensure_refdir_for "$remote_uri"
 
     echo "$refdir/objects" >> "$gitdir/objects/info/alternates"
 
-    do_scrub
+    git gc # this seems to be doing job
 }
 
 do_sizes() {
     local repodir
     for repodir in "$basedir/references"/??/*; do
-        local GIT_DIR=$repodir
-        detect_remote_uri
+        export GIT_DIR=$repodir
+        detect_sole_remote_uri
         printf "%-8s %s\n" "$(du -shx "$repodir" | cut -f1)" "$remote_uri"
     done
 }
@@ -123,5 +156,3 @@ clone|update|setup|scrub|sizes)
     ;;
 *) abort "Unknown missing/command${1:+ }${1}. Check source of $0 for help" ;;
 esac
-
-echo "$basedir"
