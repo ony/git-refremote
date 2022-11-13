@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+abort() {
+    [[ $# -gt 0 ]] && echo "$*" >&2
+    exit 1
+}
+
+todo() {
+    abort "TODO${*:+: }$*"
+}
+
+set -ex
+
+readonly scriptname="${0##*/}"
+readonly basedir="${GIT_REFREMOTE_BASE:-${XDG_CACHE_HOME:-$HOME/.cache}/git-refremote}"
+
+calc_refdir_suffix_for() {
+    local hash=$(sha1sum <<< "$1" | cut -d' ' -f1)
+    echo "references/${hash:0:2}/${hash:2}"
+}
+
+set_refdir_for() {
+    refdir="$basedir/$(calc_refdir_suffix_for "$1")"
+}
+
+detect_gitdir() {
+    gitdir=$(git rev-parse --git-dir)
+}
+
+detect_remote_uri() {
+    if [[ -z "$remote_uri" ]]; then
+        remote_uri=$(git remote get-url "$(git remote show)") || return 1
+    fi
+}
+
+detect_refdir() {
+    if [[ -z "$refdir" ]]; then
+        detect_gitdir
+        [[ -r "$gitdir/objects/info/alternates" ]] || return 1
+        detect_remote_uri
+        refdir=$(grep "$(calc_refdir_suffix_for "$remote_uri")/objects\$" "$gitdir/objects/info/alternates")
+        [[ -n "$refdir" && -d "$refdir" ]] || return 1
+        refdir="${refdir%/objects}"
+    fi
+}
+
+ensure_refdir_detected() {
+    detect_refdir || abort "Not managed by $scriptname"
+}
+
+update_refdir() {
+    git --git-dir="$refdir" remote update
+}
+
+ensure_refdir_for() {
+    if [[ -d "$refdir" ]]; then
+        update_refdir
+    else
+        git clone --mirror "$1" "$refdir"
+    fi
+}
+
+do_clone() {
+    remote_uri="$1"
+    shift 1
+    set_refdir_for "$remote_uri"
+    ensure_refdir_for "$remote_uri"
+    exec git clone --reference="$refdir" "$remote_uri" "$@"
+}
+
+do_update() {
+    ensure_refdir_detected
+    update_refdir
+    exec git remote update "$@"
+}
+
+do_scrub() {
+    detect_gitdir
+    ensure_refdir_detected
+
+    local pack obj
+    for pack in "$refdir/objects/pack"/*; do
+        pack="${pack#$refdir/objects/pack/}"
+        if [[ -e "$gitdir/objects/pack/$pack" ]]; then
+            rm -vi "$gitdir/objects/pack/$pack"
+        fi
+    done
+
+    for obj in "$refdir/objects/objects"/??/*; do
+        obj="${pack#$refdir/objects/objects/}"
+        if [[ -x "$gitdir/objects/$obj" ]]; then
+            rm -vi "$gitdir/objects/$obj"
+        fi
+    done
+}
+
+do_setup() {
+    detect_gitdir
+    detect_refdir && abort "Already managed by $scriptname"
+    detect_remote_uri
+    set_refdir_for "$remote_uri"
+    ensure_refdir_for "$remote_uri"
+
+    echo "$refdir/objects" >> "$gitdir/objects/info/alternates"
+
+    do_scrub
+}
+
+do_sizes() {
+    local repodir
+    for repodir in "$basedir/references"/??/*; do
+        local GIT_DIR=$repodir
+        detect_remote_uri
+        printf "%-8s %s\n" "$(du -shx "$repodir" | cut -f1)" "$remote_uri"
+    done
+}
+
+case "$1" in
+clone|update|setup|scrub|sizes)
+    cmd="$1"
+    shift
+    "do_${cmd}" "$@"
+    ;;
+*) abort "Unknown missing/command${1:+ }${1}. Check source of $0 for help" ;;
+esac
+
+echo "$basedir"
