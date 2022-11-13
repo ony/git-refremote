@@ -62,6 +62,8 @@ update_refdir() {
 ensure_refdir_for() {
     if [[ -d "$refdir" ]]; then
         update_refdir
+    elif [[ -n "$gitdir" && -d "$gitdir" ]]; then
+        git clone --reference "$gitdir" --dissociate --mirror "$1" "$refdir"
     else
         git clone --mirror "$1" "$refdir"
     fi
